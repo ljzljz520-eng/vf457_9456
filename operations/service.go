@@ -1,6 +1,7 @@
 package operations
 
 import (
+	"errors"
 	"fmt"
 	"streetlight/domain"
 	"streetlight/storage"
@@ -92,24 +93,72 @@ func (s *Service) ListOrders(filter domain.OrderFilter) ([]domain.WorkOrder, err
 	return out, nil
 }
 
+// maxTransitionRetries bounds the optimistic-concurrency retry loop. bbolt
+// commits are serialized, so conflicts are rare; a handful of retries is more
+// than enough for any realistic contention, and the bound prevents a runaway
+// loop under pathological conditions.
+const maxTransitionRetries = 8
+
+// applyTransition is the single atomic entry point for mutating a work order.
+// It reads, mutates, and writes the order inside one bbolt transaction via
+// UpdateWorkOrder, so the version check and the write cannot be interleaved by
+// another operation. If a concurrent writer commits first, UpdateWorkOrder
+// returns ErrVersionConflict and applyTransition re-reads and retries against
+// the new version — preventing a stale write from clobbering a newer status
+// (the dispatch-vs-inspection lost-update bug, where a new acceptance status
+// was overwritten by an older dispatch status).
+//
+// The mutator receives a pointer to the order as currently stored on disk and
+// applies the caller's own validation/business rules (each operation preserves
+// the rules it always enforced). applyTransition records the change by
+// appending a StatusTransition (from the pre-mutation status to the
+// post-mutation status) and bumping Version. No transition-graph rule is
+// imposed here — callers own their rules, exactly as before.
+func (s *Service) applyTransition(orderID string, mutator func(*domain.WorkOrder) (actor, note string, err error)) (domain.WorkOrder, error) {
+	for attempt := 0; ; attempt++ {
+		current, err := s.DB.GetWorkOrder(orderID)
+		if err != nil {
+			return domain.WorkOrder{}, err
+		}
+		if s.hook != nil {
+			s.hook("read", orderID)
+		}
+		expectedVersion := current.Version
+		updated, err := s.DB.UpdateWorkOrder(orderID, expectedVersion, func(order domain.WorkOrder) (domain.WorkOrder, error) {
+			from := order.Status
+			actor, note, e := mutator(&order)
+			if e != nil {
+				return domain.WorkOrder{}, e
+			}
+			if actor == "" { // metadata-only refresh, no history entry to record
+				return order, nil
+			}
+			order.History = append(order.History, domain.StatusTransition{Sequence: order.Version + 1, From: from, To: order.Status, Actor: actor, Note: note})
+			order.Version++
+			return order, nil
+		})
+		if err == nil {
+			if s.hook != nil {
+				s.hook("write", orderID)
+			}
+			return updated, nil
+		}
+		if !errors.Is(err, storage.ErrVersionConflict) || attempt >= maxTransitionRetries {
+			return domain.WorkOrder{}, err
+		}
+		// Another writer committed first; re-read and retry against its version.
+	}
+}
+
 func (s *Service) transition(orderID string, to domain.Status, actor, note string) error {
-	order, err := s.DB.GetWorkOrder(orderID)
-	if err != nil {
-		return err
-	}
-	if s.hook != nil {
-		s.hook("read", orderID)
-	}
-	if !domain.CanTransition(order.Status, to) {
-		return fmt.Errorf("cannot transition %s from %s to %s", orderID, order.Status, to)
-	}
-	order.Status = to
-	order.Version++
-	order.History = append(order.History, domain.StatusTransition{Sequence: order.Version, From: order.History[len(order.History)-1].To, To: to, Actor: actor, Note: note})
-	if s.hook != nil {
-		s.hook("write", orderID)
-	}
-	return s.DB.SaveWorkOrder(order)
+	_, err := s.applyTransition(orderID, func(order *domain.WorkOrder) (string, string, error) {
+		if !domain.CanTransition(order.Status, to) {
+			return "", "", fmt.Errorf("cannot transition %s from %s to %s", orderID, order.Status, to)
+		}
+		order.Status = to
+		return actor, note, nil
+	})
+	return err
 }
 
 func (s *Service) StartRepair(orderID, crewID, actor string) error {
@@ -120,15 +169,18 @@ func (s *Service) StartRepair(orderID, crewID, actor string) error {
 	if !crew.Active {
 		return fmt.Errorf("crew %s is inactive", crewID)
 	}
-	if err = s.transition(orderID, domain.StatusInProgress, actor, "repair started"); err != nil {
-		return err
-	}
-	order, err := s.DB.GetWorkOrder(orderID)
-	if err != nil {
-		return err
-	}
-	order.AssignedCrew = crewID
-	return s.DB.SaveWorkOrder(order)
+	// Transition to in-progress and record the crew assignment in one atomic
+	// update so a concurrent dispatch/inspection cannot leave the order
+	// in-progress with no crew (or vice-versa).
+	_, err = s.applyTransition(orderID, func(order *domain.WorkOrder) (string, string, error) {
+		if !domain.CanTransition(order.Status, domain.StatusInProgress) {
+			return "", "", fmt.Errorf("cannot transition %s from %s to %s", orderID, order.Status, domain.StatusInProgress)
+		}
+		order.AssignedCrew = crewID
+		order.Status = domain.StatusInProgress
+		return actor, "repair started", nil
+	})
+	return err
 }
 
 func (s *Service) CompleteRepair(update domain.RepairUpdate, recordID string) (domain.RepairRecord, error) {
@@ -146,27 +198,20 @@ func (s *Service) AcceptOrder(decision domain.AcceptanceDecision, inspectionID s
 	if !decision.IsComplete() {
 		return domain.Inspection{}, fmt.Errorf("acceptance decision is incomplete")
 	}
-	order, err := s.DB.GetWorkOrder(decision.WorkOrderID)
-	if err != nil {
-		return domain.Inspection{}, err
-	}
-	if s.hook != nil {
-		s.hook("read", decision.WorkOrderID)
-	}
-	if order.Status != domain.StatusCompleted && order.Status != domain.StatusDispatched {
-		return domain.Inspection{}, fmt.Errorf("order %s is not ready for inspection", order.ID)
-	}
+	var target domain.Status
 	if decision.Passed {
-		order.Status = domain.StatusAccepted
+		target = domain.StatusAccepted
 	} else {
-		order.Status = domain.StatusRejected
+		target = domain.StatusRejected
 	}
-	order.Version++
-	order.History = append(order.History, domain.StatusTransition{Sequence: order.Version, From: order.History[len(order.History)-1].To, To: order.Status, Actor: decision.Supervisor, Note: decision.Findings})
-	if s.hook != nil {
-		s.hook("write", decision.WorkOrderID)
-	}
-	if err = s.DB.SaveWorkOrder(order); err != nil {
+	order, err := s.applyTransition(decision.WorkOrderID, func(order *domain.WorkOrder) (string, string, error) {
+		if order.Status != domain.StatusCompleted && order.Status != domain.StatusDispatched {
+			return "", "", fmt.Errorf("order %s is not ready for inspection", order.ID)
+		}
+		order.Status = target
+		return decision.Supervisor, decision.Findings, nil
+	})
+	if err != nil {
 		return domain.Inspection{}, err
 	}
 	inspection := domain.Inspection{ID: inspectionID, WorkOrderID: order.ID, Supervisor: decision.Supervisor, Passed: decision.Passed, Findings: decision.Findings, Sequence: order.Version}
