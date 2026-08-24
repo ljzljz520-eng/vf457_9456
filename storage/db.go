@@ -13,6 +13,11 @@ import (
 
 var ErrNotFound = errors.New("record not found")
 
+// ErrVersionConflict is returned by optimistic-concurrency updates when the
+// record on disk has a different version than the one the caller read. The
+// caller should re-read and retry the change against the current version.
+var ErrVersionConflict = errors.New("record version conflict")
+
 var bucketNames = [][]byte{
 	[]byte("streetlight_poles"), []byte("control_boxes"), []byte("circuit_lines"),
 	[]byte("crews"), []byte("work_orders"), []byte("inspections"), []byte("repair_records"),
@@ -208,6 +213,54 @@ func (d *DB) SaveWorkOrder(value domain.WorkOrder) error {
 func (d *DB) GetWorkOrder(id string) (domain.WorkOrder, error) {
 	var v domain.WorkOrder
 	return v, d.read("work_orders", id, &v)
+}
+
+// UpdateWorkOrder performs a read-modify-write on a work order inside a single
+// bbolt transaction. The mutator receives the order currently on disk and
+// returns the new state. The persisted record's Version is checked against the
+// mutator's expected version; if they differ (another writer committed between
+// the caller's read and this update) the transaction is aborted with
+// ErrVersionConflict so the caller can re-read and retry.
+//
+// Because the read, the version check, and the write run in one bbolt Update,
+// no concurrent writer can overwrite the result between the check and the
+// write — closing the lost-update window that occurred when dispatch and
+// inspection each did a GetWorkOrder followed by a separate SaveWorkOrder.
+func (d *DB) UpdateWorkOrder(id string, expectedVersion int, mutator func(domain.WorkOrder) (domain.WorkOrder, error)) (domain.WorkOrder, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.db == nil {
+		return domain.WorkOrder{}, fmt.Errorf("database is closed")
+	}
+	var result domain.WorkOrder
+	err := d.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("work_orders"))
+		raw := bucket.Get([]byte(id))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var current domain.WorkOrder
+		if e := json.Unmarshal(raw, &current); e != nil {
+			return e
+		}
+		if current.Version != expectedVersion {
+			return ErrVersionConflict
+		}
+		updated, e := mutator(current)
+		if e != nil {
+			return e
+		}
+		encoded, e := json.Marshal(updated)
+		if e != nil {
+			return e
+		}
+		if e := bucket.Put([]byte(id), encoded); e != nil {
+			return e
+		}
+		result = updated
+		return nil
+	})
+	return result, err
 }
 func (d *DB) ListWorkOrders() ([]domain.WorkOrder, error) {
 	out := []domain.WorkOrder{}

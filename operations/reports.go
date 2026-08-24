@@ -72,12 +72,19 @@ func (s *Service) ReportFaultWithDuplicateCheck(report domain.FaultReport, order
 		return domain.WorkOrder{}, matches, err
 	}
 	if len(matches) > 0 {
-		order.Description = domain.NormalizeDescription(order.Description) + " [repeat of " + matches[0].OrderID + "]"
-		order.Version++
-		order.History = append(order.History, domain.StatusTransition{Sequence: order.Version, From: order.Status, To: order.Status, Actor: normalized.Reporter, Note: "repeat report linked"})
-		if err = s.DB.SaveWorkOrder(order); err != nil {
+		// Annotate the freshly created order atomically; because it was just
+		// created, expectedVersion is the reported version, and any concurrent
+		// transition surfaces as ErrVersionConflict instead of a lost update.
+		updated, err := s.DB.UpdateWorkOrder(order.ID, order.Version, func(current domain.WorkOrder) (domain.WorkOrder, error) {
+			current.Description = domain.NormalizeDescription(current.Description) + " [repeat of " + matches[0].OrderID + "]"
+			current.History = append(current.History, domain.StatusTransition{Sequence: current.Version + 1, From: current.Status, To: current.Status, Actor: normalized.Reporter, Note: "repeat report linked"})
+			current.Version++
+			return current, nil
+		})
+		if err != nil {
 			return domain.WorkOrder{}, matches, err
 		}
+		order = updated
 	}
 	return order, matches, nil
 }
@@ -132,14 +139,15 @@ func (s *Service) ReopenOrderForRepeat(orderID, actor, reason string) error {
 	if strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("repeat reason is required")
 	}
-	order, err := s.DB.GetWorkOrder(orderID)
-	if err != nil {
-		return err
-	}
-	if order.Status != domain.StatusRejected {
-		return fmt.Errorf("only rejected orders can be reopened")
-	}
-	return s.ReopenRejected(orderID, actor, domain.NormalizeDescription(reason))
+	note := domain.NormalizeDescription(reason)
+	_, err := s.applyTransition(orderID, func(order *domain.WorkOrder) (string, string, error) {
+		if order.Status != domain.StatusRejected {
+			return "", "", fmt.Errorf("only rejected orders can be reopened")
+		}
+		order.Status = domain.StatusInProgress
+		return actor, note, nil
+	})
+	return err
 }
 
 func MatchReportText(order domain.WorkOrder, query string) bool {
