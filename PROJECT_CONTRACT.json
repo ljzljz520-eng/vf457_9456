@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "metrics": {
+    "production_loc": 2591,
+    "production_files": 29,
+    "production_packages": 8,
+    "test_files": 12,
+    "production_functions": 178,
+    "decision_points": 426
+  },
+  "persistence": {
+    "module": "go.etcd.io/bbolt",
+    "entities": [
+      "StreetlightPole",
+      "ControlBox",
+      "CircuitLine",
+      "Crew",
+      "WorkOrder",
+      "Inspection",
+      "RepairRecord"
+    ],
+    "reopen_test": "TestPersistenceSurvivesReopen"
+  },
+  "workflows": [
+    {
+      "steps": [
+        "validate pole and circuit references",
+        "persist the reported work order",
+        "rank active crews for the circuit",
+        "return a dispatch plan"
+      ],
+      "test": "TestWorkflowOne"
+    },
+    {
+      "steps": [
+        "assign an eligible active crew",
+        "transition the order to in-progress",
+        "persist repair action and materials",
+        "transition the order to completed"
+      ],
+      "test": "TestWorkflowTwo"
+    },
+    {
+      "steps": [
+        "evaluate the deterministic checklist",
+        "accept or reject the work order",
+        "persist inspection evidence",
+        "render dashboard and status output"
+      ],
+      "test": "TestWorkflowThree"
+    },
+    {
+      "steps": [
+        "open a bbolt database path",
+        "persist all core entities",
+        "close the database cleanly",
+        "reopen and verify entity retrieval"
+      ],
+      "test": "TestPersistenceSurvivesReopen"
+    }
+  ]
+}
